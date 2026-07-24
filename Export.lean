@@ -137,11 +137,6 @@ def removeMData (e : Expr) : M Expr := do
   | .lam _ d b _ =>
     pure <| e.updateLambdaE! (← removeMData d) (← removeMData b)
   | .letE _ d v b _ =>
-    -- Normalize `nonDep` to `false` to avoid duplicate expression indices.
-    -- Lean's `BEq` for `Expr` considers the `nonDep` flag, but external type checkers
-    -- (e.g., nanoda_lib) treat expressions as identical regardless of this optimization hint.
-    -- Without normalization, the same expression can get different indices, causing parse errors.
-    -- See: https://github.com/ammkrn/lean4export/commit/eb023e5
     pure <| e.updateLet! (← removeMData d) (← removeMData v) (← removeMData b) false
   | .forallE _ d b _ =>
     pure <| e.updateForallE! (← removeMData d) (← removeMData b)
@@ -152,7 +147,65 @@ def removeMData (e : Expr) : M Expr := do
 
 mutual
 
+/-- Heuristic: true if the expression tree is deeper than 1000 nodes along
+    any path.  Used to skip `getIdx` caching for extremely deep trees that
+    would trigger the kernel's "too many bound variables" panic. -/
+partial def isDeepExpr (e : Expr) : Bool :=
+  let rec go (e : Expr) (d : Nat) : Bool :=
+    if d > 1000 then true else
+      match e with
+      | .forallE _ _ b _ => go b (d+1)
+      | .lam _ _ b _ => go b (d+1)
+      | .app f a => go f d || go a d
+      | .letE _ _ _ b _ => go b d
+      | .proj _ _ e2 => go e2 d
+      | .mdata _ e' => go e' d
+      | _ => false
+  go e 0
+
 partial def dumpExprAux (e : Expr) : M Nat := do
+  -- bvar indices are meaningful only relative to their binder context.
+  -- Caching them via visitedExprs would share the same {"bvar": N} JSON
+  -- across different binder depths, producing wrong de Bruijn values.
+  if let .bvar i := e then
+    let st ← get
+    let idx := st.visitedExprs.size
+    let json : Json := .mkObj [("bvar", i)]
+    IO.println <| json.setObjVal! "ie" idx |>.compress
+    modify fun st => { st with visitedExprs := st.visitedExprs.insert (.bvar idx) idx }
+    return idx
+  -- Very deep expressions (>1000 nested forallE/lam) can trigger
+  -- "too many bound variables" when the kernel computes their hash
+  -- or compares them via BEq.  Short-circuit by emitting directly.
+  if isDeepExpr e then
+    -- Emit directly without getIdx caching to avoid kernel hash/BEq recursion.
+    let st ← get
+    let idx := st.visitedExprs.size
+    -- Build JSON body by matching on e and calling dumpExprAux for children.
+    -- Use separate let-bindings to avoid do-notation inside match arms.
+    let json : Json ← match e with
+      | .app f a => do
+        let fn ← dumpExprAux f; let arg ← dumpExprAux a
+        pure <| Json.mkObj [("app", Json.mkObj [("fn", fn), ("arg", arg)])]
+      | .forallE n d b bi => do
+        let nm ← dumpName n; let ty ← dumpExprAux d; let bd ← dumpExprAux b
+        pure <| Json.mkObj [("forallE", Json.mkObj [("name", nm), ("type", ty), ("body", bd), ("binderInfo", bi.toJson)])]
+      | .lam n d b bi => do
+        let nm ← dumpName n; let ty ← dumpExprAux d; let bd ← dumpExprAux b
+        pure <| Json.mkObj [("lam", Json.mkObj [("name", nm), ("type", ty), ("body", bd), ("binderInfo", bi.toJson)])]
+      | .letE n d v b no => do
+        let nm ← dumpName n; let ty ← dumpExprAux d; let vl ← dumpExprAux v; let bd ← dumpExprAux b
+        pure <| Json.mkObj [("letE", Json.mkObj [("name", nm), ("type", ty), ("value", vl), ("body", bd), ("nondep", no)])]
+      | .proj s i e2 => do
+        let sn ← dumpName s; let stc ← dumpExprAux e2
+        pure <| Json.mkObj [("proj", Json.mkObj [("typeName", sn), ("idx", i), ("struct", stc)])]
+      | .mdata a e' => do
+        let e'' ← dumpExprAux e'
+        pure <| Json.mkObj [("mdata", Json.mkObj [("data", a.toJson), ("expr", e'')])]
+      | _ => pure <| Json.mkObj [("bvar", 0)]
+    IO.println <| json.setObjVal! "ie" idx |>.compress
+    modify fun st => { st with visitedExprs := st.visitedExprs.insert (.bvar idx) idx }
+    return idx
   getIdx e "ie" (·.visitedExprs) ({ · with visitedExprs := · }) do
     match e with
     | .fvar .. | .mvar .. => panic! "cannot export free variables or metavariables"
