@@ -49,6 +49,10 @@ use crate::value::{
 #[derive(Debug, Clone)]
 pub enum Json {
     Bool(bool),
+    /// Small machine integers — rendered without allocating (unlike
+    /// `Num`), which matters because `dump_expr` builds one `Json` tree
+    /// per output line (100M+ lines on Mathlib).
+    Int(u64),
     Num(String),
     Str(String),
     Arr(Vec<Json>),
@@ -57,7 +61,7 @@ pub enum Json {
 
 impl Json {
     fn num(n: u64) -> Json {
-        Json::Num(n.to_string())
+        Json::Int(n)
     }
 
     /// Build an object, sorting the fields by key (byte order).
@@ -76,6 +80,7 @@ impl Json {
     fn render(&self, out: &mut String) {
         match self {
             Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Int(n) => push_u64(out, *n),
             Json::Num(n) => out.push_str(n),
             Json::Str(s) => render_string(s, out),
             Json::Arr(elems) => {
@@ -104,6 +109,22 @@ impl Json {
     }
 }
 
+/// Decimal rendering of a `u64` into `out`, without allocating.
+fn push_u64(out: &mut String, mut n: u64) {
+    if n == 0 {
+        out.push('0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
 /// `Json.renderString` / `escape` (Lean/Data/Json/Printer.lean): escape
 /// `"`, `\`, `\n`, `\r`; emit all other chars >= 0x20 raw; render chars
 /// below 0x20 as `\uXXXX`.
@@ -127,6 +148,53 @@ fn render_string(s: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+// ---------------------------------------------------------------------------
+// FxHash (rustc-hash's `FxHasher`, inlined to keep the crate dependency-free)
+// ---------------------------------------------------------------------------
+
+/// Keys for the export-time maps are small integers/indices, so SipHash
+/// (std's default) wastes ~20ns/op on hashing; this multiply-xor hasher is
+/// a few ns and distributes indices uniformly. The export-time maps are
+/// lookup-only (never iterated for output), so the hasher choice cannot
+/// affect the output bytes.
+const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+#[derive(Default, Clone, Copy)]
+pub struct FxBuildHasher;
+
+impl std::hash::BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher { hash: FX_SEED }
+    }
+}
+
+pub struct FxHasher {
+    hash: u64,
+}
+
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.hash = (self.hash.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(FX_SEED);
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.write(&[i]);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.write(&i.to_le_bytes());
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.write(&i.to_le_bytes());
+    }
+    fn finish(&self) -> u64 {
+        self.hash
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +486,7 @@ fn mix_hash(a: u32, b: u32) -> u32 {
 /// handle hashing consistent: equal content ⟺ equal handle.
 fn hash_u32<T: std::hash::Hash>(x: &T) -> u32 {
     use std::hash::Hasher;
-    let mut s = std::collections::hash_map::DefaultHasher::new();
+    let mut s = FxHasher { hash: FX_SEED };
     x.hash(&mut s);
     s.finish() as u32
 }
@@ -446,11 +514,11 @@ pub struct Exporter<'a, W: Write> {
     /// per-bucket `Vec` of the previous `HashMap<u32, Vec<..>>` wasted a
     /// 24-byte header + malloc rounding per entry (~1.8GB). The map is
     /// shardable by hash bits for multi-threaded export.
-    visited_exprs: HashMap<u32, VisitedExpr>,
-    visited_overflow: HashMap<u32, Vec<VisitedExpr>>,
+    visited_exprs: HashMap<u32, VisitedExpr, FxBuildHasher>,
+    visited_overflow: HashMap<u32, Vec<VisitedExpr>, FxBuildHasher>,
     expr_count: u64,
-    visited_constants: std::collections::HashSet<Name>,
-    recursor_map: HashMap<Name, LeanNameSet>,
+    visited_constants: std::collections::HashSet<Name, FxBuildHasher>,
+    recursor_map: HashMap<Name, LeanNameSet, FxBuildHasher>,
     /// Memoized alpha-hash per node index, dense array (stored as
     /// `hash + 1`, `0` = uncomputed; Lean's cached `Expr.Data.hash`).
     /// Nodes are interned and immutable, so the hash is a pure function of
@@ -485,6 +553,9 @@ pub struct Exporter<'a, W: Write> {
     /// DAGs of tactic-generated proofs this is exponential (a single
     /// `needs_strip` call ran for 10+ minutes on Mathlib).
     has_mdata: Vec<bool>,
+    /// Reusable render buffer for one output line; its capacity is kept
+    /// across lines so emitting does not allocate per line.
+    line_buf: String,
 }
 
 impl<'a, W: Write> Exporter<'a, W> {
@@ -496,7 +567,7 @@ impl<'a, W: Write> Exporter<'a, W> {
         // each bucket), i.e. the **reverse** of `env.constants.toList`
         // (which is what the main export loop uses). `env.constants` here
         // is stored in `toList` order, so iterate it in reverse.
-        let mut recursor_map: HashMap<Name, LeanNameSet> = HashMap::new();
+        let mut recursor_map: HashMap<Name, LeanNameSet, FxBuildHasher> = HashMap::default();
         for (name, ci) in env.constants.iter().rev() {
             if let ConstantInfo::Rec(rec) = ci {
                 for &ind in &rec.all {
@@ -534,23 +605,30 @@ impl<'a, W: Write> Exporter<'a, W> {
             out,
             visited_names: vec![0u64],
             visited_levels: vec![0u64],
-            visited_exprs: HashMap::new(),
-            visited_overflow: HashMap::new(),
+            visited_exprs: HashMap::default(),
+            visited_overflow: HashMap::default(),
             deep_cache: Vec::new(),
             size_cache: Vec::new(),
             has_mdata,
             name_count: 1,
             level_count: 1,
             expr_count: 0,
-            visited_constants: std::collections::HashSet::new(),
+            visited_constants: std::collections::HashSet::default(),
             recursor_map,
             hash_cache: Vec::new(),
             no_mdata: Vec::new(),
+            line_buf: String::new(),
         }
     }
 
-    fn emit(&mut self, line: &str) {
-        let _ = self.out.write_all(line.as_bytes());
+    /// Render a JSON value into the reusable line buffer and write it out
+    /// (plus a newline). Unlike `Json::compress` + `emit`, this reuses the
+    /// buffer's allocation across lines instead of allocating one `String`
+    /// per output line.
+    fn emit_json(&mut self, j: &Json) {
+        self.line_buf.clear();
+        j.render(&mut self.line_buf);
+        let _ = self.out.write_all(self.line_buf.as_bytes());
         let _ = self.out.write_all(b"\n");
     }
 
@@ -581,12 +659,10 @@ impl<'a, W: Write> Exporter<'a, W> {
         let body = self.name_json(n)?;
         let idx = self.name_count;
         self.name_count += 1;
-        let line = Json::obj(vec![
+        self.emit_json(&Json::obj(vec![
             ("in".to_string(), Json::num(idx)),
             (body.0, body.1),
-        ])
-        .compress();
-        self.emit(&line);
+        ]));
         self.visited_names[key] = idx;
         Ok(idx)
     }
@@ -628,12 +704,10 @@ impl<'a, W: Write> Exporter<'a, W> {
         let body = self.level_json(l)?;
         let idx = self.level_count;
         self.level_count += 1;
-        let line = Json::obj(vec![
+        self.emit_json(&Json::obj(vec![
             ("il".to_string(), Json::num(idx)),
             (body.0, body.1),
-        ])
-        .compress();
-        self.emit(&line);
+        ]));
         self.visited_levels[key] = idx;
         Ok(idx)
     }
@@ -882,12 +956,10 @@ impl<'a, W: Write> Exporter<'a, W> {
             let body = self.expr_body_json(e)?;
             let idx = self.expr_count;
             self.expr_count += 1;
-            let line = Json::obj(vec![
+            self.emit_json(&Json::obj(vec![
                 (body.0, body.1),
                 ("ie".to_string(), Json::num(idx)),
-            ])
-            .compress();
-            self.emit(&line);
+            ]));
             return Ok(idx);
         }
         let hash = self.alpha_hash(e);
@@ -898,12 +970,10 @@ impl<'a, W: Write> Exporter<'a, W> {
         let body = self.expr_body_json(e)?;
         let idx = self.expr_count;
         self.expr_count += 1;
-        let line = Json::obj(vec![
+        self.emit_json(&Json::obj(vec![
             (body.0, body.1),
             ("ie".to_string(), Json::num(idx)),
-        ])
-        .compress();
-        self.emit(&line);
+        ]));
         self.visited_expr_insert(hash, size, e, idx);
         Ok(idx)
     }
@@ -1443,8 +1513,7 @@ impl<'a, W: Write> Exporter<'a, W> {
     }
 
     fn dump_obj(&mut self, fields: Vec<(String, Json)>) -> Result<(), String> {
-        let line = Json::obj(fields).compress();
-        self.emit(&line);
+        self.emit_json(&Json::obj(fields));
         Ok(())
     }
 
@@ -1484,7 +1553,7 @@ impl<'a, W: Write> Exporter<'a, W> {
                 ),
             ]),
         )]);
-        self.emit(&meta.compress());
+        self.emit_json(&meta);
         let mut n_done = 0usize;
         let mut next_report = 5000usize;
         match only {
