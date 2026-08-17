@@ -172,7 +172,14 @@ partial def dumpExprAux (e : Expr) : M Nat := do
     let idx := st.visitedExprs.size
     let json : Json := .mkObj [("bvar", i)]
     IO.println <| json.setObjVal! "ie" idx |>.compress
-    modify fun st => { st with visitedExprs := st.visitedExprs.insert (.bvar idx) idx }
+    -- Reserve the slot with a unique dummy key.  We cannot use `.bvar idx`
+    -- here: the kernel panics with "too many bound variables" once the
+    -- expression count exceeds 2^20-1 (see lean_expr_mk_data in
+    -- src/kernel/expr.cpp).  Use a fvar with a unique name instead; it can
+    -- never collide with a real expression (constants cannot contain
+    -- fvars, and the name is unique per index) and has no bvar range.
+    let dummy : Expr := .fvar (FVarId.mk (.str Name.anonymous s!"lean4export.bvar.{idx}"))
+    modify fun st => { st with visitedExprs := st.visitedExprs.insert dummy idx }
     return idx
   -- Very deep expressions (>1000 nested forallE/lam) can trigger
   -- "too many bound variables" when the kernel computes their hash
