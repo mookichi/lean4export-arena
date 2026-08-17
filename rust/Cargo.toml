@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/olean"]
+
+[package]
+name = "lean4export-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of lean4export: read .olean files and emit lean4export NDJSON"
+
+[dependencies]
+olean = { path = "crates/olean" }
+
+[[bin]]
+name = "lean4export-rs"
+path = "src/main.rs"

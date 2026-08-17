@@ -1,0 +1,7 @@
+[package]
+name = "olean"
+version = "0.1.0"
+edition = "2021"
+description = "Reader for Lean 4 .olean files (compacted region format)"
+
+[dependencies]
