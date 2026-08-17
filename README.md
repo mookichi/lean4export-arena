@@ -30,6 +30,9 @@ The option `--export-mdata"` can be used to include `Expr.mdata` items in the ex
 
 ## Rust reimplementation (`rust/`)
 
+**Quickstart:** see [`docs/quickstart.md`](docs/quickstart.md) for how to
+point `lean4export-rs` at a Lean project and emit NDJSON.
+
 `rust/` contains an independent Rust reimplementation (`lean4export-rs`) that
 reads `.olean` files directly and emits the same NDJSON format, without going
 through the Lean kernel. It reproduces the reference exporter's output
