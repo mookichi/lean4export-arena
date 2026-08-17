@@ -41,7 +41,8 @@ test axioms); the README of nanoda recommends this for the prelude's
 
 ## Running
 
-Stream the exporter directly into nanoda:
+Stream the exporter directly into nanoda, without ever writing the
+NDJSON to disk:
 
 ```bash
 lean4export-rs --export Init --lean-path <sysroot>/lib/lean \
@@ -49,6 +50,32 @@ lean4export-rs --export Init --lean-path <sysroot>/lib/lean \
 ```
 
 or point `export_file_path` at a saved export file with `use_stdin: false`.
+
+The exporter writes the NDJSON stream to stdout (progress goes to
+stderr), and nanoda reads it from stdin when `use_stdin: true`, so the
+pipe is a true streaming pipeline — the export is consumed incrementally
+as it is produced, and no intermediate file is created. Verified with a
+full Init export piped directly into the unmodified nanoda binary
+using the whitelist config above:
+`Checked 57422 declarations with no errors, skipping exported but
+unpermitted axioms ["Lean.ofReduceNat", "sorryAx", "Lean.ofReduceBool"]`
+(exit 0) — identical to the file-based run.
+
+Axioms are checked against the `permitted_axioms` whitelist (the
+semi-official `Quot.sound`, `Classical.choice`, `propext`, plus
+`Lean.trustCompiler`); do **not** use `unsafe_permit_all_axioms` for
+verification — it admits every axiom to the environment unchecked. The
+three skipped axioms above are declared for metaprograms only and never
+used by other declarations, so skipping them is safe (nanoda's README
+recommends this for the prelude's `sorryAx`).
+
+Note: the pipeline's exit status is nanoda's (the last command); the
+exporter reports `Broken pipe` on stderr only when nanoda exits early
+(e.g. on a hard error), which is expected. If you want the exporter's
+status too, run with `set -o pipefail`.
+
+The pipe also saves disk: a full Mathlib export (5.9 GB as a file)
+streams straight through without touching disk.
 
 ## Results (August 2026, Lean v4.30.0)
 
