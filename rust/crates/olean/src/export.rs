@@ -11,8 +11,10 @@
 //!   (byte-wise `String` order).
 //! - `getIdx` assigns an index *after* the children of a node have been
 //!   dumped (`idx := m.size`), so index allocation order matters.
-//! - `bvar` expressions are never cached; each occurrence gets a fresh
-//!   index. Expressions deeper than 1000 nodes are likewise emitted
+//! - `bvar` expressions are cached like any other node (upstream
+//!   behavior): repeated occurrences become back-references, so no
+//!   duplicate content lines are emitted (external checkers such as
+//!   nanoda reject them). Expressions deeper than 1000 nodes are emitted
 //!   without caching (`isDeepExpr`).
 //! - `env.constants` iterates in `Name.quickCmp` order: by `Name.hash`
 //!   first, then structurally. The hash is read from the `.olean` name
@@ -861,22 +863,25 @@ impl<'a, W: Write> Exporter<'a, W> {
     }
 
     fn dump_expr_aux(&mut self, e: Expr) -> Result<u64, String> {
-        // bvar: never cached; every occurrence gets a fresh index.
-        if let ExprNode::BVar(i) = self.node(e) {
-            let idx = self.expr_count;
-            self.expr_count += 1;
-            let line = Json::obj(vec![
-                ("bvar".to_string(), Json::num(i)),
-                ("ie".to_string(), Json::num(idx)),
-            ])
-            .compress();
-            self.emit(&line);
-            return Ok(idx);
-        }
+        // `bvar` nodes go through the normal cached path like every other
+        // expression (matching upstream lean4export and Lean's own kernel,
+        // where a de Bruijn index is a shared value): repeated occurrences
+        // of `bvar N` become back-references, so the export never contains
+        // duplicate content lines (external checkers such as nanoda reject
+        // them).
         if self.lam_depth_memo(e) > DEEP_EXPR_THRESHOLD {
+            // Deep expressions are emitted without caching (matching the
+            // Lean exporter's `isDeepExpr`), but the index must be
+            // assigned *after* the children are dumped — like the cached
+            // path — so the stream stays index-continuous (children first,
+            // parent last). Reserving the parent's index before dumping
+            // the children emits the children's lines with *larger*
+            // indices before the parent's line, which external checkers
+            // reject as a back-reference mismatch (e.g. a 500-deep
+            // `forallE` chain in Phase0Test produced a 500-index gap).
+            let body = self.expr_body_json(e)?;
             let idx = self.expr_count;
             self.expr_count += 1;
-            let body = self.expr_body_json(e)?;
             let line = Json::obj(vec![
                 (body.0, body.1),
                 ("ie".to_string(), Json::num(idx)),
@@ -1796,8 +1801,32 @@ pub fn decode_module_selected(
         .decode_part_lite(0, arenas)
         .map_err(|e| format!("decode failed ({name} exported): {e}"))?;
     let is_module = exported.is_module;
+    eprintln!("  [dbg] {name}: is_module={is_module}");
     // Segment indices: 0 = exported, 1 = server, 2 = private.
     let idx = if is_module { 2 } else { 0 };
+    if name == "Init.BinderNameHint" {
+        let md0 = olean
+            .decode_part_lite(0, arenas)
+            .map_err(|e| format!("decode failed ({name} exported): {e}"))?;
+        eprintln!(
+            "  [dbg] exported constants: {}",
+            md0.constants
+                .iter()
+                .map(|c| arenas.names.to_lean_string(c.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Ok(md2) = olean.decode_part_lite(2, arenas) {
+            eprintln!(
+                "  [dbg] private constants: {}",
+                md2.constants
+                    .iter()
+                    .map(|c| arenas.names.to_lean_string(c.name()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
     let md = if idx == 0 {
         exported
     } else {

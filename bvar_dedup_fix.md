@@ -1,5 +1,17 @@
 # Fix: bvar deduplication in lean4export
 
+> **Update (Aug 2026):** this design was **reversed** in the Rust
+> reimplementation (`rust/crates/olean/src/export.rs`). The Rust exporter
+> now caches `bvar` nodes like upstream lean4export (repeated occurrences
+> become back-references), because external kernel checkers such as nanoda
+> reject duplicate content lines. The Lean exporter (`Export.lean`)
+> retains the always-fresh behavior described below; the golden files are
+> therefore regenerated from the Rust implementation and validated with
+> nanoda instead of byte-comparison against the Lean exporter. See
+> `docs/nanoda-verification.md`. The concerns about scope-sensitive
+> downstream consumers documented below still apply to the Lean
+> exporter's output.
+
 ## Problem
 
 `lean4export` caches all `Expr` nodes via `getIdx`/`visitedExprs`, including
