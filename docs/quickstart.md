@@ -74,6 +74,7 @@ lean4export-rs --export Mathlib \
 | `--export-unsafe` | Include unsafe declarations (default: skipped) |
 | `--limit N` | Stop after N non-internal constants (debugging) |
 | `--only <name>` | Dump only the named constant(s); repeatable, e.g. `--only MyModule.Even` |
+| `--only-prefix <prefix>` | Dump every non-internal constant whose name starts with the prefix; repeatable, e.g. `--only-prefix Nat.` |
 | `--lean-path <dir>` | Add an `.olean` search directory; repeatable |
 
 Environment:
@@ -88,10 +89,18 @@ Examples:
 lean4export-rs --export Phase0Test \
   --only Phase0Test.withLet --export-mdata > withLet.mdata.ndjson
 
+# Every Nat.* constant (the constant itself plus its dependencies)
+lean4export-rs --export Init --only-prefix Nat. > nat.ndjson
+
 # Full Mathlib export, unsafe declarations included
 lean4export-rs --export Mathlib --export-unsafe \
   $(bash rust/scripts/mathlib_roots.sh /path/to/mathlib4) > mathlib.ndjson
 ```
+
+`--only` / `--only-prefix` selections are unioned and can be combined
+(`--only A --only-prefix B.`). Dependencies of the selected constants are
+always included, so the output can be piped straight into nanoda for
+verification.
 
 ## 5. Verify the output
 

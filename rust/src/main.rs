@@ -13,6 +13,7 @@ fn main() -> ExitCode {
     if args.len() < 2 {
         eprintln!("usage: lean4export-rs <module.olean> [--full] [--names] [--constnames]");
         eprintln!("       lean4export-rs --export <module> [--export-mdata] [--export-unsafe] [--lean-path <dir>]");
+        eprintln!("                       [--only <name> ...] [--only-prefix <prefix> ...] [--limit <N>]");
         return ExitCode::from(2);
     }
     let export_mode = args.iter().any(|a| a == "--export");
@@ -75,6 +76,26 @@ fn run_export(args: &[String]) -> Result<(), String> {
         v
     };
 
+    // `--only-prefix <prefix> [--only-prefix <prefix> ...]`: dump every
+    // constant whose `to_lean_string` name starts with the prefix (e.g.
+    // `--only-prefix Nat.` selects all `Nat.*` constants). Combined with
+    // `--only`, both selections are unioned.
+    let only_prefixes: Vec<String> = {
+        let mut v = Vec::new();
+        let mut j = 0;
+        while j < args.len() {
+            if args[j] == "--only-prefix" {
+                if let Some(s) = args.get(j + 1) {
+                    v.push(s.clone());
+                    j += 2;
+                    continue;
+                }
+            }
+            j += 1;
+        }
+        v
+    };
+
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
     let mut j = 0;
     while j < args.len() {
@@ -107,18 +128,33 @@ fn run_export(args: &[String]) -> Result<(), String> {
         export_mdata,
         export_unsafe,
     };
-    let only: Option<Vec<Name>> = if only_parts.is_empty() {
+    let only: Option<Vec<Name>> = if only_parts.is_empty() && only_prefixes.is_empty() {
         None
     } else {
-        Some(
-            only_parts
-                .iter()
-                .map(|parts| {
-                    let parts: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-                    arenas.names.intern_path(&parts)
-                })
-                .collect(),
-        )
+        let mut names: Vec<Name> = only_parts
+            .iter()
+            .map(|parts| {
+                let parts: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                arenas.names.intern_path(&parts)
+            })
+            .collect();
+        if !only_prefixes.is_empty() {
+            for (n, _) in &env.constants {
+                // Skip internal names (`_...`, numerals) just like the
+                // full-export path: `--only-prefix Nat.` should select the
+                // public `Nat.*` constants, not Lean's internal
+                // `Nat.add._unsafe_rec`/`Nat._sunfold` machinery (which
+                // nanoda rejects as partial/unsafe definitions).
+                if arenas.names.is_internal(*n) {
+                    continue;
+                }
+                let s = arenas.names.to_lean_string(*n);
+                if only_prefixes.iter().any(|p| s.starts_with(p)) {
+                    names.push(*n);
+                }
+            }
+        }
+        Some(names)
     };
     let only = only.as_deref();
     let mut out = std::io::BufWriter::new(std::io::stdout());
