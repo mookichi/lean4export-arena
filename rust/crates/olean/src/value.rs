@@ -391,6 +391,19 @@ impl NameTable {
         &self.strings[si as usize]
     }
 
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Number of distinct interned strings (side table size).
+    pub fn str_count(&self) -> usize {
+        self.strings.len()
+    }
+
     pub fn is_anonymous(&self, n: Name) -> bool {
         matches!(self.node(n), NameNode::Anonymous)
     }
@@ -499,6 +512,14 @@ impl LevelTable {
     /// The node for a level handle.
     pub fn node(&self, l: Level) -> LevelNode {
         self.nodes[l.0 as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
     }
 }
 
@@ -647,6 +668,21 @@ impl ExprTable {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty() && self.scratch.is_empty()
+    }
+
+    /// Number of distinct interned universe lists (side table size).
+    pub fn level_list_count(&self) -> usize {
+        self.level_lists.len()
+    }
+
+    /// Number of distinct interned literals (side table size).
+    pub fn lit_count(&self) -> usize {
+        self.lits.len()
+    }
+
+    /// Number of distinct interned `MData` KVMaps (side table size).
+    pub fn kv_count(&self) -> usize {
+        self.kvs.len()
     }
 }
 

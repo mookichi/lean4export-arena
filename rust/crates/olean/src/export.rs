@@ -23,9 +23,12 @@
 //!   `size*4/3 > buckets`).
 //!
 //! Expressions are arena handles ([`crate::value::Expr`]); the memo caches
-//! (`hash_cache`, `deep_cache`, `size_cache`, `no_mdata`) are keyed by
-//! node index instead of heap address — with content interning, identical
-//! nodes share one index, so a single cache entry covers every occurrence.
+//! (`hash_cache`, `deep_cache`, `size_cache`, `no_mdata`) are dense arrays
+//! keyed by node index instead of `HashMap`s — with content interning,
+//! identical nodes share one index, so a single slot covers every
+//! occurrence, lookups are O(1) direct-indexed (no hashing, no buckets),
+//! and the arrays can later be shared across threads as write-once atomic
+//! slots (each node's memo value is a pure function of its index).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -429,35 +432,61 @@ pub struct Exporter<'a, W: Write> {
     arenas: &'a mut Arenas,
     opts: ExportOptions,
     out: W,
-    visited_names: HashMap<Name, u64>,
-    visited_levels: HashMap<Level, u64>,
-    visited_exprs: HashMap<u32, Vec<VisitedExpr>>,
+    /// Output index per name, dense array keyed by name index (`u64::MAX`
+    /// = not yet dumped). `name_count` is the next index to assign.
+    visited_names: Vec<u64>,
+    /// Output index per level, dense array keyed by level index.
+    visited_levels: Vec<u64>,
+    /// `expr index` dedup table: `hash → (size, expr, idx)` for the first
+    /// node with each alpha-hash, plus an overflow map for the rare
+    /// hash-colliding buckets. ~99.6% of buckets hold a single entry
+    /// (33.68M of 33.81M entries at 5K Mathlib constants), so the
+    /// per-bucket `Vec` of the previous `HashMap<u32, Vec<..>>` wasted a
+    /// 24-byte header + malloc rounding per entry (~1.8GB). The map is
+    /// shardable by hash bits for multi-threaded export.
+    visited_exprs: HashMap<u32, VisitedExpr>,
+    visited_overflow: HashMap<u32, Vec<VisitedExpr>>,
     expr_count: u64,
     visited_constants: std::collections::HashSet<Name>,
     recursor_map: HashMap<Name, LeanNameSet>,
-    /// Memoized alpha-hash per node index (Lean's cached `Expr.Data.hash`).
-    hash_cache: HashMap<NodeIdx, u32>,
-    /// Memoized `removeMData` results keyed by original node index (Lean's
-    /// `noMDataExprs`), so shared subtrees are stripped once.
-    no_mdata: HashMap<NodeIdx, NodeIdx>,
-    /// Memoized max `lam`/`forallE` nesting depth per node index (see
-    /// `lam_depth_memo`). Without this, every dump re-walked the whole
-    /// subtree: for the long `app` spines of tactic-generated proofs this
-    /// is O(spine) per node (O(n^2) per tree) — ~2e10 node visits on the
-    /// full Lean export.
-    deep_cache: HashMap<NodeIdx, u32>,
-    /// Memoized subtree node count per index (see `size_memo`), used as
-    /// a cheap pre-filter in the `visited_exprs` comparison so the
-    /// structural comparison only runs for same-size candidates.
-    size_cache: HashMap<NodeIdx, u32>,
+    /// Memoized alpha-hash per node index, dense array (stored as
+    /// `hash + 1`, `0` = uncomputed; Lean's cached `Expr.Data.hash`).
+    /// Nodes are interned and immutable, so the hash is a pure function of
+    /// the index — direct-indexed O(1), no hashing, MT-ready as atomic
+    /// write-once slots.
+    hash_cache: Vec<u32>,
+    /// Memoized `removeMData` results keyed by original env node index
+    /// (Lean's `noMDataExprs`), dense array (`u32::MAX` = uncomputed). The
+    /// stripped tree of an env node is a pure function of the node, so the
+    /// memo is **global** (never cleared per constant): stripping once per
+    /// env node — instead of once per (constant, node) pair — removes the
+    /// per-constant re-strip work and bounds the scratch section by the
+    /// distinct stripped subtrees.
+    no_mdata: Vec<u32>,
+    /// Memoized max `lam`/`forallE` nesting depth per node index, dense
+    /// array (stored as `depth + 1`, `0` = uncomputed). See `hash_cache`.
+    deep_cache: Vec<u32>,
+    /// Memoized subtree node count per node index, dense array (`0` =
+    /// uncomputed; sizes are always ≥ 1). See `hash_cache`.
+    size_cache: Vec<u32>,
+    /// Next output index for names/levels (the dense arrays' `.len()` is
+    /// the largest interned index + 1, not the count of dumped entries).
+    name_count: u64,
+    level_count: u64,
+    /// Precomputed `needs_strip` flags: for every env node, whether its
+    /// subtree contains an `mdata` node or a `nondep`-`letE`. Computed once
+    /// in a single bottom-up pass (`ExprTable` guarantees children have
+    /// smaller indices than their parents). `needs_strip` is called for
+    /// every constant's type/value root and for every node inside
+    /// `strip_mdata`; the previous unmemoized recursive walk re-visited
+    /// shared interned subtrees along every path — for the heavily-shared
+    /// DAGs of tactic-generated proofs this is exponential (a single
+    /// `needs_strip` call ran for 10+ minutes on Mathlib).
+    has_mdata: Vec<bool>,
 }
 
 impl<'a, W: Write> Exporter<'a, W> {
     pub fn new(env: &'a Env, arenas: &'a mut Arenas, opts: ExportOptions, out: W) -> Exporter<'a, W> {
-        let mut visited_names = HashMap::new();
-        visited_names.insert(Name(0), 0);
-        let mut visited_levels = HashMap::new();
-        visited_levels.insert(Level(0), 0);
         // `initState`: map each inductive to the set of recursors that
         // recurse on it. It iterates `for (_, constInfo) in env.constants`,
         // whose `ForIn` is `SMap.forM` = `map₁.forM` — the raw
@@ -476,21 +505,45 @@ impl<'a, W: Write> Exporter<'a, W> {
                 }
             }
         }
+        // Bottom-up mdata-presence flags: children always have smaller
+        // indices than their parents (decode interns children first;
+        // `push_scratch` appends after), so one pass over index order is a
+        // valid topological order. `Vec<bool>` is bit-packed (~1 bit per
+        // node).
+        let n_env = arenas.exprs.env_len();
+        let mut has_mdata = vec![false; n_env];
+        for i in 0..n_env {
+            has_mdata[i] = match arenas.exprs.node(Expr(i as NodeIdx)) {
+                ExprNode::MData(_, _) => true,
+                ExprNode::App(f, a) => has_mdata[f as usize] || has_mdata[a as usize],
+                ExprNode::Lam(_, t, b, _) => has_mdata[t as usize] || has_mdata[b as usize],
+                ExprNode::ForallE(_, t, b, _) => has_mdata[t as usize] || has_mdata[b as usize],
+                ExprNode::LetE(_, t, v, b, nd) => {
+                    nd || has_mdata[t as usize] || has_mdata[v as usize] || has_mdata[b as usize]
+                }
+                ExprNode::Proj(_, _, st) => has_mdata[st as usize],
+                _ => false,
+            };
+        }
         Exporter {
             env,
             arenas,
             opts,
             out,
-            visited_names,
-            visited_levels,
+            visited_names: vec![0u64],
+            visited_levels: vec![0u64],
             visited_exprs: HashMap::new(),
-            deep_cache: HashMap::new(),
-            size_cache: HashMap::new(),
+            visited_overflow: HashMap::new(),
+            deep_cache: Vec::new(),
+            size_cache: Vec::new(),
+            has_mdata,
+            name_count: 1,
+            level_count: 1,
             expr_count: 0,
             visited_constants: std::collections::HashSet::new(),
             recursor_map,
-            hash_cache: HashMap::new(),
-            no_mdata: HashMap::new(),
+            hash_cache: Vec::new(),
+            no_mdata: Vec::new(),
         }
     }
 
@@ -505,21 +558,34 @@ impl<'a, W: Write> Exporter<'a, W> {
         self.arenas.exprs.node(e)
     }
 
+    /// Grow a dense memo array to cover `idx`. Children are interned
+    /// before parents and scratch nodes are appended, so the arrays only
+    /// ever extend; `fill` is the "uncomputed" sentinel.
+    fn grow<T: Copy>(v: &mut Vec<T>, idx: usize, fill: T) {
+        if idx >= v.len() {
+            v.resize(idx + 1, fill);
+        }
+    }
+
     // ---- dumpName / dumpLevel --------------------------------------------
 
     fn dump_name(&mut self, n: Name) -> Result<u64, String> {
-        if let Some(&idx) = self.visited_names.get(&n) {
-            return Ok(idx);
+        let key = n.0 as usize;
+        Self::grow(&mut self.visited_names, key, u64::MAX);
+        let v = self.visited_names[key];
+        if v != u64::MAX {
+            return Ok(v);
         }
         let body = self.name_json(n)?;
-        let idx = self.visited_names.len() as u64;
+        let idx = self.name_count;
+        self.name_count += 1;
         let line = Json::obj(vec![
             ("in".to_string(), Json::num(idx)),
             (body.0, body.1),
         ])
         .compress();
         self.emit(&line);
-        self.visited_names.insert(n, idx);
+        self.visited_names[key] = idx;
         Ok(idx)
     }
 
@@ -551,18 +617,22 @@ impl<'a, W: Write> Exporter<'a, W> {
     }
 
     fn dump_level(&mut self, l: Level) -> Result<u64, String> {
-        if let Some(&idx) = self.visited_levels.get(&l) {
-            return Ok(idx);
+        let key = l.0 as usize;
+        Self::grow(&mut self.visited_levels, key, u64::MAX);
+        let v = self.visited_levels[key];
+        if v != u64::MAX {
+            return Ok(v);
         }
         let body = self.level_json(l)?;
-        let idx = self.visited_levels.len() as u64;
+        let idx = self.level_count;
+        self.level_count += 1;
         let line = Json::obj(vec![
             ("il".to_string(), Json::num(idx)),
             (body.0, body.1),
         ])
         .compress();
         self.emit(&line);
-        self.visited_levels.insert(l, idx);
+        self.visited_levels[key] = idx;
         Ok(idx)
     }
 
@@ -611,9 +681,11 @@ impl<'a, W: Write> Exporter<'a, W> {
     /// `visited_exprs` can reject hash-colliding candidates of different
     /// sizes without a structural comparison.
     fn size_memo(&mut self, e: Expr) -> u32 {
-        let key = e.0;
-        if let Some(&s) = self.size_cache.get(&key) {
-            return s;
+        let key = e.0 as usize;
+        Self::grow(&mut self.size_cache, key, 0);
+        let v = self.size_cache[key];
+        if v != 0 {
+            return v;
         }
         let s = match self.node(e) {
             ExprNode::App(f, a) => {
@@ -632,7 +704,7 @@ impl<'a, W: Write> Exporter<'a, W> {
             ExprNode::MData(_, inner) => self.size_memo(Expr(inner)).saturating_add(1),
             _ => 1,
         };
-        self.size_cache.insert(key, s);
+        self.size_cache[key] = s;
         s
     }
 
@@ -648,9 +720,11 @@ impl<'a, W: Write> Exporter<'a, W> {
     /// (children are looked up in the memo, so the whole export is O(total
     /// env nodes)).
     fn lam_depth_memo(&mut self, e: Expr) -> u32 {
-        let key = e.0;
-        if let Some(&d) = self.deep_cache.get(&key) {
-            return d;
+        let key = e.0 as usize;
+        Self::grow(&mut self.deep_cache, key, 0);
+        let v = self.deep_cache[key];
+        if v != 0 {
+            return v.wrapping_sub(1);
         }
         let d = match self.node(e) {
             ExprNode::Lam(_, _, b, _) | ExprNode::ForallE(_, _, b, _) => 1 + self.lam_depth_memo(Expr(b)),
@@ -660,7 +734,7 @@ impl<'a, W: Write> Exporter<'a, W> {
             ExprNode::MData(_, e2) => self.lam_depth_memo(Expr(e2)),
             _ => 0,
         };
-        self.deep_cache.insert(key, d);
+        self.deep_cache[key] = d.wrapping_add(1);
         d
     }
 
@@ -668,7 +742,22 @@ impl<'a, W: Write> Exporter<'a, W> {
     /// an `mdata` node, or a `letE` with `nondep := true` (which
     /// `removeMData` rewrites to `false`). Mirrors the parts of
     /// `Export.lean`'s `removeMData` that actually transform the tree.
+    ///
+    /// O(1): precomputed in `Exporter::new` (see `has_mdata`).
     fn needs_strip(&self, e: Expr) -> bool {
+        let i = e.0 as usize;
+        if i < self.has_mdata.len() {
+            return self.has_mdata[i];
+        }
+        // Defensive fallback for out-of-range handles. Never hit in
+        // practice: `dump_expr` (roots) and `strip_mdata` (recursion) only
+        // query env nodes; scratch nodes are only ever produced by
+        // `strip_mdata`, never walked.
+        self.needs_strip_walk(e)
+    }
+
+    /// Unmemoized recursive `needs_strip` (defensive fallback only).
+    fn needs_strip_walk(&self, e: Expr) -> bool {
         match self.node(e) {
             ExprNode::MData(_, _) => true,
             ExprNode::App(f, a) => self.needs_strip(Expr(f)) || self.needs_strip(Expr(a)),
@@ -690,15 +779,18 @@ impl<'a, W: Write> Exporter<'a, W> {
     /// Subtrees that `removeMData` would not change (no `mdata`, no
     /// `nondep`-`letE`) are returned as the original env node itself;
     /// changed subtrees get fresh scratch nodes (appended after the env
-    /// nodes, truncated per constant). Every result — changed or not — is
-    /// stored in `no_mdata` under the stable env index, so repeated strips
-    /// of the same env node return the same handle, and `clear_no_mdata`
-    /// can invalidate the index-keyed `hash_cache` entries of every node
-    /// it is about to free.
+    /// nodes). Every result — changed or not — is stored in the dense
+    /// `no_mdata` under the stable env index, so repeated strips of the
+    /// same env node return the same handle. The memo is global (not
+    /// cleared per constant): a stripped env subtree is a pure function of
+    /// the node, so stripping once per node is both faster and bounds the
+    /// scratch section by the distinct stripped subtrees.
     fn strip_mdata(&mut self, e: Expr) -> Expr {
-        let key = e.0;
-        if let Some(&s) = self.no_mdata.get(&key) {
-            return Expr(s);
+        let key = e.0 as usize;
+        Self::grow(&mut self.no_mdata, key, u32::MAX);
+        let v = self.no_mdata[key];
+        if v != u32::MAX {
+            return Expr(v);
         }
         let stripped: Expr = if !self.needs_strip(e) {
             e
@@ -738,29 +830,34 @@ impl<'a, W: Write> Exporter<'a, W> {
                 other => Expr(self.arenas.exprs.push_scratch(other)),
             }
         };
-        self.no_mdata.insert(key, stripped.0);
+        self.no_mdata[key] = stripped.0;
         stripped
     }
 
-    /// Clear the `removeMData` memo (matching `Main.lean`'s
-    /// `noMDataExprs := {}` before each constant). The stripped scratch
-    /// nodes themselves are kept (indices are never reused), because
-    /// handles to them live in the long-lived `visited_exprs`/
-    /// `hash_cache` maps.
-    fn clear_no_mdata(&mut self) {
-        self.no_mdata.clear();
-    }
-
     fn visited_expr_lookup(&self, hash: u32, size: u32, e: Expr) -> Option<u64> {
-        let bucket = self.visited_exprs.get(&hash)?;
-        bucket
+        if let Some(&(s, x, idx)) = self.visited_exprs.get(&hash) {
+            if s == size && expr_alpha_eq(&*self.arenas, e, x) {
+                return Some(idx);
+            }
+        }
+        self.visited_overflow
+            .get(&hash)?
             .iter()
             .find(|(s, x, _)| *s == size && expr_alpha_eq(&*self.arenas, e, *x))
             .map(|(_, _, idx)| *idx)
     }
 
     fn visited_expr_insert(&mut self, hash: u32, size: u32, e: Expr, idx: u64) {
-        self.visited_exprs.entry(hash).or_default().push((size, e, idx));
+        // Only called on a lookup miss, so a present main entry is a
+        // different structure sharing the hash → overflow bucket.
+        match self.visited_exprs.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.visited_overflow.entry(hash).or_default().push((size, e, idx));
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((size, e, idx));
+            }
+        }
     }
 
     fn dump_expr_aux(&mut self, e: Expr) -> Result<u64, String> {
@@ -811,12 +908,14 @@ impl<'a, W: Write> Exporter<'a, W> {
     /// most once per unique node — mirroring Lean's cached `Expr.Data.hash`.
     /// `u32` matches Lean's 32-bit hash field.
     fn alpha_hash(&mut self, e: Expr) -> u32 {
-        let key = e.0;
-        if let Some(&h) = self.hash_cache.get(&key) {
-            return h;
+        let key = e.0 as usize;
+        Self::grow(&mut self.hash_cache, key, 0);
+        let v = self.hash_cache[key];
+        if v != 0 {
+            return v.wrapping_sub(1);
         }
         let h = self.alpha_hash_uncached(e);
-        self.hash_cache.insert(key, h);
+        self.hash_cache[key] = h.wrapping_add(1);
         h
     }
 
@@ -1386,8 +1485,6 @@ impl<'a, W: Write> Exporter<'a, W> {
         match only {
             Some(list) => {
                 for &n in list {
-                    // `Main.lean`: `noMDataExprs := {}` before each constant.
-                    self.clear_no_mdata();
                     self.dump_constant(n)?;
                     n_done += 1;
                     if n_done >= next_report {
@@ -1402,8 +1499,6 @@ impl<'a, W: Write> Exporter<'a, W> {
                     if self.arenas.names.is_internal(n) {
                         continue;
                     }
-                    // `Main.lean`: `noMDataExprs := {}` before each constant.
-                    self.clear_no_mdata();
                     self.dump_constant(n)?;
                     n_done += 1;
                     if let Some(l) = limit {
@@ -1420,8 +1515,8 @@ impl<'a, W: Write> Exporter<'a, W> {
                         eprintln!(
                             "[trace] constants={n_done} name={} rss={rss}MB names={} exprs={} hash_cache={} no_mdata={}",
                             self.arenas.names.to_lean_string(n),
-                            self.visited_names.len(),
-                            self.visited_exprs.values().map(|v| v.len()).sum::<usize>(),
+                            self.name_count,
+                            self.visited_exprs.len(),
                             self.hash_cache.len(),
                             self.no_mdata.len()
                         );
@@ -1443,13 +1538,20 @@ impl<'a, W: Write> Exporter<'a, W> {
                     .and_then(|v| v.parse::<u64>().ok())
             })
             .unwrap_or(0);
+        let n_buckets = self.visited_exprs.len();
+        let n_overflow = self.visited_overflow.values().map(|v| v.len()).sum::<usize>();
+        let n_entries = n_buckets + n_overflow;
+        let visited_bytes = n_buckets * 24 + n_overflow * 40 + n_entries * 16;
+        let dense_bytes =
+            (self.hash_cache.len() + self.size_cache.len() + self.deep_cache.len()) * 4
+                + self.no_mdata.len() * 4
+                + self.visited_names.len() * 8
+                + self.visited_levels.len() * 8;
         eprintln!(
-            "[mem] constants={n_done} names={} levels={} exprs={} hash_cache={} no_mdata={} rss={}MB",
-            self.visited_names.len(),
-            self.visited_levels.len(),
-            self.visited_exprs.values().map(|v| v.len()).sum::<usize>(),
-            self.hash_cache.len(),
-            self.no_mdata.len(),
+            "[mem] constants={n_done} exprs={n_entries} buckets={n_buckets} visited_MB={} dense_MB={} scratch={} rss={}MB",
+            visited_bytes / (1024 * 1024),
+            dense_bytes / (1024 * 1024),
+            self.arenas.exprs.len() - self.arenas.exprs.env_len(),
             rss / 1024
         );
     }
@@ -1764,7 +1866,13 @@ fn is_prop_cheap(env: &Env, arenas: &Arenas, ty: Expr) -> bool {
 /// Expression handles are interned, so handle equality is structural
 /// equality.
 fn subsumes_info(env: &Env, arenas: &Arenas, a: &ConstantInfo, b: &ConstantInfo) -> bool {
-    if a.name() != b.name() || a.ty_expr() != b.ty_expr() || a.level_params() != b.level_params() {
+    // `Expr.BEq` (== on types) is `lean_expr_equal`, which ignores binder
+    // names: two modules defining the same instance with different
+    // `_hygCtx` binder names are alpha-equal and subsume each other.
+    if a.name() != b.name()
+        || !expr_alpha_eq(arenas, a.ty_expr(), b.ty_expr())
+        || a.level_params() != b.level_params()
+    {
         return false;
     }
     match (a, b) {
